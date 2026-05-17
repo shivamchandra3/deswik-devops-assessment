@@ -1,0 +1,200 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        default: dev
+        type: choice
+        options: [dev, staging, prod]
+
+env:
+  AWS_REGION: ap-southeast-2
+
+# Cancel any in-progress run for the same branch to avoid stale deployments
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Lint & CDK Synth
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: cdk
+        run: npm ci
+
+      # Synthesise CloudFormation templates without deploying — catches CDK errors early
+      - name: CDK Synth (dev)
+        working-directory: cdk
+        run: npx cdk synth -c environment=dev -c imageTag=pr-${{ github.sha }}
+
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    # Only push on real deployments, not on PRs
+    if: github.event_name != 'pull_request'
+    needs: validate
+    permissions:
+      id-token: write  # required for OIDC token exchange
+      contents: read
+
+    outputs:
+      image-tag: ${{ steps.vars.outputs.image-tag }}
+      ecr-registry: ${{ steps.login-ecr.outputs.registry }}
+      environment: ${{ steps.vars.outputs.environment }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve deployment variables
+        id: vars
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          ENVIRONMENT="${{ github.event.inputs.environment || 'dev' }}"
+          echo "image-tag=sha-${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "environment=${ENVIRONMENT}" >> $GITHUB_OUTPUT
+          echo "Deploying image sha-${SHORT_SHA} to ${ENVIRONMENT}"
+
+      # OIDC authentication — no long-lived AWS credentials stored in GitHub Secrets.
+      # The IAM role trust policy must allow github.com/YOUR_ORG/YOUR_REPO.
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-${{ github.run_id }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Deploy the Platform stack first so ECR repository exists before we push
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: cdk
+        run: npm ci
+
+      - name: Deploy Platform Stack (VPC, ECR, ECS Cluster)
+        working-directory: cdk
+        run: |
+          npx cdk deploy "${{ steps.vars.outputs.environment }}-Platform" \
+            -c environment=${{ steps.vars.outputs.environment }} \
+            -c imageTag=${{ steps.vars.outputs.image-tag }} \
+            --require-approval never
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          file: ./app/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.vars.outputs.environment }}/hello-world:${{ steps.vars.outputs.image-tag }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ steps.vars.outputs.environment }}/hello-world:latest
+          # Registry cache avoids rebuilding unchanged layers on every run
+          cache-from: type=registry,ref=${{ steps.login-ecr.outputs.registry }}/${{ steps.vars.outputs.environment }}/hello-world:latest
+          cache-to: type=inline
+          # Disable provenance attestation — not yet supported by all ECR configurations
+          provenance: false
+          build-args: |
+            BUILD_VERSION=${{ steps.vars.outputs.image-tag }}
+
+  deploy:
+    name: CDK Deploy Application
+    runs-on: ubuntu-latest
+    needs: build
+    environment:
+      name: ${{ needs.build.outputs.environment }}
+      url: https://${{ steps.outputs.outputs.alb-dns }}
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: cdk
+        run: npm ci
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActions-Deploy-${{ github.run_id }}
+
+      # Deploying the Application stack with a new imageTag triggers a rolling
+      # ECS task replacement. The circuit breaker rolls back automatically if
+      # the new tasks fail their health checks.
+      - name: Deploy Application Stack (ECS Service + ALB + Observability)
+        working-directory: cdk
+        run: |
+          npx cdk deploy "${{ needs.build.outputs.environment }}-Application" \
+            -c environment=${{ needs.build.outputs.environment }} \
+            -c imageTag=${{ needs.build.outputs.image-tag }} \
+            --require-approval never \
+            --outputs-file cdk-outputs.json
+
+      - name: Extract ALB endpoint
+        id: outputs
+        run: |
+          ALB_DNS=$(jq -r '.[] | to_entries[] | select(.key | test("AlbDnsName")) | .value' cdk/cdk-outputs.json)
+          echo "alb-dns=${ALB_DNS}" >> $GITHUB_OUTPUT
+          echo "::notice title=Deployment URL::http://${ALB_DNS}"
+
+      - name: Upload CDK outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-outputs-${{ needs.build.outputs.image-tag }}
+          path: cdk/cdk-outputs.json
+          retention-days: 30
+
+      - name: Smoke test — verify ALB responds
+        run: |
+          ALB_DNS="${{ steps.outputs.outputs.alb-dns }}"
+          echo "Testing http://${ALB_DNS}/health ..."
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${ALB_DNS}/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed (attempt $i)"
+              exit 0
+            fi
+            echo "Attempt $i: status ${STATUS} — retrying in 15 s"
+            sleep 15
+          done
+          echo "Smoke test failed after 10 attempts"
+          exit 1

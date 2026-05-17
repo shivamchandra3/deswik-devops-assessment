@@ -1,0 +1,30 @@
+{
+  "name": "deswik-platform-cdk",
+  "version": "1.0.0",
+  "description": "AWS CDK infrastructure for the Deswik platform",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy:dev": "cdk deploy --all -c environment=dev --require-approval never",
+    "deploy:staging": "cdk deploy --all -c environment=staging",
+    "deploy:prod": "cdk deploy --all -c environment=prod"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "@types/source-map-support": "^0.5.10",
+    "aws-cdk": "2.x",
+    "ts-node": "^10.9.2",
+    "typescript": "~5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "2.x",
+    "constructs": "^10.0.0",
+    "source-map-support": "^0.5.21"
+  }
+}

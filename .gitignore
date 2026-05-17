@@ -1,0 +1,12 @@
+node_modules/
+dist/
+cdk.out/
+*.js
+*.d.ts
+*.js.map
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store
+cdk-outputs.json
